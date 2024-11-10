@@ -1,172 +1,98 @@
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import { Admin } from "../models/admin.model.js"; // Make sure this path is correct
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { Admin } from '../models/admin.model.js';
+import ApiError from '../utils/ApiError.js';
+import AsyncHandler from '../utils/AsyncHandler.js';
+import ApiResponse from '../utils/ApiResponse.js';
 
-// Helper function to validate required fields
-const validateFields = (requiredFields, body) => {
-  for (const field of requiredFields) {
-    if (!body[field]) {
-      return `Field '${field}' is required.`;
-    }
-  }
-  return null;
-};
-
-
-//   Register Controller
-//   Allows a new admin to register
-//   Public route
-export const register = async (req, res) => {
-  const requiredFields = ["name", "username", "password"];
-  const validationError = validateFields(requiredFields, req.body);
-
-  if (validationError) {
-    return res.status(400).json({ message: validationError });
-  }
-
-  try {
+export const registerAdmin = AsyncHandler(async (req, res, next) => {
     const { name, username, password } = req.body;
 
+    // Validate required fields
+    if (!name || !username || !password) {
+        return next(new ApiError(400, "All fields are required"));
+    }
+
+    // Check if the username is already taken
     const existingAdmin = await Admin.findOne({ username });
     if (existingAdmin) {
-      return res.status(400).json({ message: "Username is already taken" });
+        return next(new ApiError(409, "Username already taken"));
     }
 
-    const newAdmin = new Admin({ name, username, password });
+    // Hash the password and create the new admin
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newAdmin = new Admin({ name, username, password: hashedPassword });
     await newAdmin.save();
 
-    res.status(201).json({ message: "Admin registered successfully" });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error registering admin", error: error.message });
-  }
-};
+    res.status(201).json(new ApiResponse(201, "Admin registered successfully", newAdmin));
+});
 
-
-/**
- * Login Controller
- * Logs in an admin and sets access and refresh tokens in HTTP-only cookies
- * Public route
- */
-export const login = async (req, res) => {
-  const requiredFields = ["username", "password"];
-  const validationError = validateFields(requiredFields, req.body);
-
-  if (validationError) {
-    return res.status(400).json({ message: validationError });
-  }
-
-  try {
+export const loginAdmin = AsyncHandler(async (req, res, next) => {
     const { username, password } = req.body;
 
+    if (!username || !password) {
+        return next(new ApiError(400, "Username and password are required"));
+    }
+
+    // Find the admin by username
     const admin = await Admin.findOne({ username });
     if (!admin) {
-      return res.status(400).json({ message: "Invalid username or password" });
+        return next(new ApiError(401, "Invalid credentials"));
     }
 
-    const isPasswordCorrect = await admin.isPasswordCorrect(password);
+    // Check if the password is correct
+    const isPasswordCorrect = await bcrypt.compare(password, admin.password);
     if (!isPasswordCorrect) {
-      return res.status(400).json({ message: "Invalid username or password" });
+        return next(new ApiError(401, "Invalid credentials"));
     }
 
-    // Generate tokens
-    const accessToken = admin.generateAccessToken();
-    const refreshToken = admin.generateRefreshToken();
+    // Generate JWT tokens
+    const accessToken = jwt.sign({ _id: admin._id, username: admin.username }, process.env.ACCESS_TOKEN_SECRET, { expiresIn: process.env.ACCESS_TOKEN_EXPIRY });
+    const refreshToken = jwt.sign({ _id: admin._id }, process.env.REFRESH_TOKEN_SECRET, { expiresIn: process.env.REFRESH_TOKEN_EXPIRY });
 
-    // Set cookies with tokens
-    res.cookie("accessToken", accessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 15 * 60 * 1000, // 15 minutes for access token
-    });
+    // Set access token in cookies
+    res.cookie("accessToken", accessToken, { httpOnly: true, secure: process.env.NODE_ENV === "production" });
+    res.cookie("refreshToken", refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === "production" });
 
-    res.cookie("refreshToken", refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "strict",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days for refresh token
-    });
+    res.status(200).json(new ApiResponse(200, "Admin logged in successfully", { accessToken, refreshToken }));
+});
 
-    res.status(200).json({ message: "Login successful" });
-  } catch (error) {
-    res.status(500).json({ message: "Error logging in", error: error.message });
-  }
-};
+export const logoutAdmin = AsyncHandler(async (req, res) => {
+    res.clearCookie("accessToken");
+    res.clearCookie("refreshToken");
+    res.status(200).json(new ApiResponse(200, "Admin logged out successfully"));
+});
 
-/**
- * Logout Controller
- * Logs out an admin by clearing the access and refresh tokens in cookies
- * Protected route (requires authMiddleware)
- */
-export const logout = async (req, res) => {
-  try {
-    res.cookie("accessToken", "", { maxAge: 0, httpOnly: true });
-    res.cookie("refreshToken", "", { maxAge: 0, httpOnly: true });
+export const updateAdmin = AsyncHandler(async (req, res, next) => {
+    const { id } = req.params;
+    const { name, username, password } = req.body;
 
-    res.status(200).json({ message: "Logout successful" });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error logging out", error: error.message });
-  }
-};
-
-/**
- * Update Controller
- * Updates the admin's information (name or password)
- * Protected route (requires authMiddleware)
- */
-export const update = async (req, res) => {
-  const updatableFields = ["name", "password"];
-  const hasUpdatableField = updatableFields.some((field) => req.body[field]);
-
-  if (!hasUpdatableField) {
-    return res
-      .status(400)
-      .json({
-        message:
-          "At least one field ('name' or 'password') is required to update",
-      });
-  }
-
-  try {
-    const { name, password } = req.body;
-
-    const admin = await Admin.findById(req.adminId);
-    if (!admin) {
-      return res.status(404).json({ message: "Admin not found" });
+    // Validate at least one field is provided
+    if (!name && !username && !password) {
+        return next(new ApiError(400, "At least one field is required to update"));
     }
 
-    if (name) admin.name = name;
-    if (password) admin.password = await bcrypt.hash(password, 10);
+    const updateData = {};
 
-    await admin.save();
-    res.status(200).json({ message: "Admin updated successfully" });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error updating admin", error: error.message });
-  }
-};
+    if (name) updateData.name = name;
+    if (username) updateData.username = username;
+    if (password) updateData.password = await bcrypt.hash(password, 10);
 
-
-//   Delete Controller
-//   Deletes the admin account
-//   Protected route (requires authMiddleware)
- 
-export const deleteAdmin = async (req, res) => {
-  try {
-    const admin = await Admin.findByIdAndDelete(req.adminId);
-    if (!admin) {
-      return res.status(404).json({ message: "Admin not found" });
+    const updatedAdmin = await Admin.findByIdAndUpdate(id, updateData, { new: true, runValidators: true });
+    if (!updatedAdmin) {
+        return next(new ApiError(404, "Admin not found"));
     }
 
-    res.status(200).json({ message: "Admin deleted successfully" });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error deleting admin", error: error.message });
-  }
-};
+    res.status(200).json(new ApiResponse(200, "Admin updated successfully", updatedAdmin));
+});
+
+export const deleteAdmin = AsyncHandler(async (req, res, next) => {
+    const { id } = req.params;
+
+    const deletedAdmin = await Admin.findByIdAndDelete(id);
+    if (!deletedAdmin) {
+        return next(new ApiError(404, "Admin not found"));
+    }
+
+    res.status(200).json(new ApiResponse(200, "Admin deleted successfully"));
+});
